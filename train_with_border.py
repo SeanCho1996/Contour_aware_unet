@@ -15,16 +15,16 @@ from dataset_with_border import *
 from unet2d import UNet
 from copy import deepcopy
 import os
-os.chdir('/home/zhaozixiao/projects/Torch_Border')
-os.environ['CUDA_VISIBLE_DEVICES'] = "0, 1, 2, 3"
+
+# os.chdir('/home/zhaozixiao/projects/Torch_Border')
+os.environ['CUDA_VISIBLE_DEVICES'] = "4, 5, 6, 7" # config multi-gpu for training
 
 
 # %% hyper parameters
-
 batch_size = 8
 epoch = 50
 snapshot = 5
-num_classes = 3
+num_classes = 4
 
 device = torch.device('cuda')
 
@@ -32,25 +32,20 @@ weight_name = 'model_512_unet2loss'
 
 
 # %% import model
-salt = BorderUNet(num_classes)
+model = BorderUNet(num_classes)
+model = DataParallel(model) # parallel training
+model.to(device)
+# model.load_state_dict(torch.load("/home/zhaozixiao/projects/Torch_UNet/model_voc_resunet/model_512_resunet_49.pth"))
 
-salt = DataParallel(salt)
+# scheduler_step = epoch // snapshot
 
-salt.to(device)
-# salt.load_state_dict(torch.load("/home/zhaozixiao/projects/Torch_UNet/model_voc_resunet/model_512_resunet_49.pth"))
-
-
-scheduler_step = epoch // snapshot
-
-# optimizer_ft = torch.optim.Adam(filter(lambda p: p.requires_grad, salt.parameters()), lr=1e-4)
+# optimizer_ft = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
 optimizer_ft = torch.optim.SGD(
-    filter(lambda p: p.requires_grad, salt.parameters()), lr=1e-3, momentum=0.9)
+    filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, momentum=0.9)
 exp_lr_scheduler = torch.optim.lr_scheduler.StepLR(
     optimizer_ft, step_size=13, gamma=0.1)
 
 # %% pre-process
-
-
 class ResizeSquarePad(Resize, Pad):
     def __init__(self, target_length, interpolation_strategy, pad_value):
         if not isinstance(target_length, (int, Sequence)):
@@ -105,7 +100,7 @@ transform_border = torchvision.transforms.Compose([
     ResizeSquarePad(512, Image.NEAREST, 255)
 ])
 
-
+# %% define loss
 class DiceLoss(nn.Module):
     def __init__(self):
         super(DiceLoss, self).__init__()
@@ -166,6 +161,7 @@ class MulticlassDiceLoss(nn.Module):
         return totalLoss
 
 
+# %% define accuracy function
 class MeanIoU(nn.Module):
     """
     prediction: model's output with shape [b, c, h, w]
@@ -202,15 +198,10 @@ class MeanIoU(nn.Module):
         miou = sum(iou_list) / len(iou_list)
         return iou_list, miou
 
+# %% Load data
+# img_dir = "./pets/"
+img_dir = "./polyp/"
 
-# %%
-# Load data
-img_dir = "./pets/"
-# img_dir = "./polyp/"
-# train_image_dir = "/home/zhaozixiao/projects/Torch_UNet/datasets/voc.devkit/train_full"
-# val_image_dir = "/home/zhaozixiao/projects/Torch_UNet/datasets/voc.devkit/val_full"
-
-# %%
 X_train, y_train, X_val, y_val = ImageFetch(img_dir)
 # X_train, y_train = trainImageFetch(train_image_dir)
 # X_val, y_val = valImageFetch(val_image_dir)
@@ -221,8 +212,8 @@ train_data = SegDataset(X_train, y_train, 'train',
 val_data = SegDataset(X_val, y_val, 'val', transform_img,
                       transform_mask, transform_border)
 
-a, b, c = train_data[0]
-# %%
+a, b, c = train_data[0] # extract one batch for data verification
+# %% dataloader
 train_loader = DataLoader(train_data,
                           shuffle=RandomSampler(train_data),
                           batch_size=batch_size)
@@ -231,16 +222,13 @@ val_loader = DataLoader(val_data,
                         shuffle=False,
                         batch_size=batch_size)
 
-# %%
+# %% initialize loss and accuracy
 criterion_ce = nn.CrossEntropyLoss(weight=torch.Tensor([1, 100]), ignore_index=255)
-# criterion_ce = nn.CrossEntropyLoss(ignore_index=255)
 criterion_dice = MulticlassDiceLoss(ignore_labels=[255])
-# criterion_border = nn.BCEWithLogitsLoss()
 
 miou_accuracy = MeanIoU(ignore_labels=[255])
 
-# %%
-
+# %% define train and validation function
 def train(train_loader, model):
     running_loss = 0.0
     acc = 0.0
@@ -253,31 +241,24 @@ def train(train_loader, model):
             device), borders.long().to(device)
         optimizer_ft.zero_grad()
 
-        # weight = torch.Tensor([1, int(len(borders[borders == 0])/len(borders[borders == 1]))]).to(device)
-
         out, init_border = model(inputs)
 
+        # recall ratio is an optional accuracy function
         # predict = torch.argmax(nn.Softmax(dim=1)(out), dim=1)
         # pure_mask = masks.masked_select(masks.ne(255))
         # pure_predict = predict.masked_select(masks.ne(255))
         # acc += pure_mask.cpu().eq(pure_predict.cpu()).sum().item()/len(pure_mask)
 
         acc += miou_accuracy(out, masks)[1]
-        # print(miou)
 
-        # loss_init = criterion_seg(init_seg, masks)
-        criterion_ce.to(device)
+        criterion_ce.to(device) # need to load weight variable to cuda
         loss_border = criterion_ce(init_border, borders)
-        # loss_seg = criterion_dice(init_seg, masks.unsqueeze(1))
         loss_final = criterion_dice(out, masks.unsqueeze(1))
-        # loss_seg = criterion_seg(out, masks)
 
-        # loss = loss_init + loss_border + loss_seg
         loss = loss_border + loss_final
 
         loss.backward()
         optimizer_ft.step()
-        # print(loss.item())
         running_loss += loss.item() * batch_size
 
     epoch_loss = running_loss / data_size
@@ -299,21 +280,17 @@ def test(test_loader, model):
 
             out, fine_border = model(inputs)
 
-            # _, miou = miou_accuracy(out, masks)
-
+            # still recall ratio
             # predict = torch.argmax(nn.Softmax(dim=1)(out), dim=1)
             # pure_mask = masks.masked_select(masks.ne(255))
             # pure_predict = predict.masked_select(masks.ne(255))
             # acc += pure_mask.cpu().eq(pure_predict.cpu()).sum().item()/len(pure_mask)
+
             acc += miou_accuracy(out, masks)[1]
 
-
-            # loss_init = criterion_seg(init_seg, masks)
             loss_border = criterion_ce(fine_border, borders)
-            # loss_seg = criterion_dice(init_seg, masks.unsqueeze(1))
             loss_final = criterion_dice(out, masks.unsqueeze(1))
 
-            # loss = loss_seg + loss_init + loss_border
             loss = loss_border + loss_final
 
             running_loss += loss.item() * batch_size
@@ -330,104 +307,102 @@ writer = SummaryWriter("./log/polyp_borderloss")
 
 
 for epoch_ in range(epoch):
-    train_loss, train_acc = train(train_loader, salt)
-    val_loss, accuracy = test(val_loader, salt)
+    train_loss, train_acc = train(train_loader, model)
+    val_loss, accuracy = test(val_loader, model)
     exp_lr_scheduler.step()
 
     writer.add_scalar('loss/train', train_loss, epoch_)
     writer.add_scalar('loss/valid', val_loss, epoch_)
     writer.add_scalar('accuracy', accuracy, epoch_)
-    # writer.add_scalars('Val_loss', {'val_loss': val_loss}, n_iter)
-
-    if accuracy > best_acc:
-      best_acc = accuracy
-      best_param = salt.state_dict()
 
     print('epoch: {} train_loss: {:.3f} train_accuracy: {:.3f} val_loss: {:.3f} val_accuracy: {:.3f}'.format(
         epoch_ + 1, train_loss, train_acc, val_loss, accuracy))
-    torch.save(salt.module.state_dict(),
-               './model_pet_borderloss_512/' + weight_name + '_%d.pth' % epoch_)
+    torch.save(model.module.state_dict(),
+               './model_polyp_borderloss_512/' + weight_name + '_%d.pth' % epoch_)
 writer.close()
 
-# %%
-# salt = BorderUNet(2)
-# salt.load_state_dict(torch.load("/home/zhaozixiao/projects/Torch_Border/model_pet_borderfusion_512/model_512_borderunet_49.pth"))
-# salt.cuda()
 
-# for i, img in enumerate(X_val):
-#     ori_image = img
-#     name = os.path.splitext(ori_image.filename.split("/")[-1])[0]
-#     img = transform_img(img)
+# training procedure is over in this step
+# %% prediction on validation dataset
+model = BorderUNet(num_classes)
+model.load_state_dict(torch.load("./model_polyp_borderloss_512/model_512_unet2loss_49.pth"))
+model.cuda()
 
-#     img = img.cuda()
+for i, img in enumerate(X_val):
+    ori_image = img
+    name = os.path.splitext(ori_image.filename.split("/")[-1])[0]
+    img = transform_img(img)
 
-#     out, init_seg, border = salt(img.unsqueeze(0))
+    img = img.cuda()
 
-#     predict = out.squeeze(0)
-#     predict = nn.Softmax(dim=0)(predict)
-#     predict = torch.argmax(predict, dim=0)
+    out, init_seg, border = model(img.unsqueeze(0))
 
-#     border = border.squeeze(0)
-#     border = nn.Softmax(dim=0)(border)
-#     border = torch.argmax(border, dim=0)
+    predict = out.squeeze(0)
+    predict = nn.Softmax(dim=0)(predict)
+    predict = torch.argmax(predict, dim=0)
 
-#     w, h = ori_image.size
-#     if w > h:
-#         re_h = int(np.round(512 * (h / w)))
-#         total_pad = 512 - re_h
-#         half_pad = total_pad // 2
-#         out = predict[half_pad: half_pad + re_h, :]
-#         b = border[half_pad: half_pad + re_h, :]
-#     else:
-#         re_w = int(np.round(512 * (w / h)))
-#         total_pad = 512 - re_w
-#         half_pad = total_pad // 2
-#         out = predict[:, half_pad: half_pad + re_w]
-#         b = border[:, half_pad: half_pad + re_w]
+    border = border.squeeze(0)
+    border = nn.Softmax(dim=0)(border)
+    border = torch.argmax(border, dim=0)
 
-#     predict = cv2.resize(out.cpu().numpy(), (w, h),
-#                          interpolation=cv2.INTER_NEAREST)
-#     border_pred = cv2.resize(b.cpu().numpy(), (w, h),
-#                          interpolation=cv2.INTER_NEAREST)
+    w, h = ori_image.size
+    if w > h:
+        re_h = int(np.round(512 * (h / w)))
+        total_pad = 512 - re_h
+        half_pad = total_pad // 2
+        out = predict[half_pad: half_pad + re_h, :]
+        b = border[half_pad: half_pad + re_h, :]
+    else:
+        re_w = int(np.round(512 * (w / h)))
+        total_pad = 512 - re_w
+        half_pad = total_pad // 2
+        out = predict[:, half_pad: half_pad + re_w]
+        b = border[:, half_pad: half_pad + re_w]
 
-#     # out_img = np.zeros((320, 320, 3))
+    predict = cv2.resize(out.cpu().numpy(), (w, h),
+                         interpolation=cv2.INTER_NEAREST)
+    border_pred = cv2.resize(b.cpu().numpy(), (w, h),
+                         interpolation=cv2.INTER_NEAREST)
 
-#     out_png = Image.fromarray(predict.astype(np.uint8))
+    # out_img = np.zeros((320, 320, 3))
 
-#     border_pred[border_pred == 1] = 255
-#     out_border = Image.fromarray(border_pred.astype(np.uint8))
+    out_png = Image.fromarray(predict.astype(np.uint8))
 
-#     palette = []
-#     for j in range(256):
-#         palette.extend((j, j, j))
-#     palette[:3*21] = np.array([[0, 0, 0],
-#         [128, 0, 0],
-#         [0, 128, 0],
-#         [128, 128, 0],
-#         [0, 0, 128],
-#         [128, 0, 128],
-#         [0, 128, 128],
-#         [128, 128, 128],
-#         [64, 0, 0],
-#         [192, 0, 0],
-#         [64, 128, 0],
-#         [192, 128, 0],
-#         [64, 0, 128],
-#         [192, 0, 128],
-#         [64, 128, 128],
-#         [192, 128, 128],
-#         [0, 64, 0],
-#         [128, 64, 0],
-#         [0, 192, 0],
-#         [128, 192, 0],
-#         [0, 64, 128]
-#         ], dtype='uint8').flatten()
-#     out_png.putpalette(palette)
-#     # out_border.putpalette(palette)
+    border_pred[border_pred == 1] = 255
+    out_border = Image.fromarray(border_pred.astype(np.uint8))
 
-#     out_png.save(
-#         "/home/zhaozixiao/projects/Torch_Border/polyp_results/" + name + ".png")
-#     out_border.save(
-#         "/home/zhaozixiao/projects/Torch_Border/polyp_results/border_" + name + ".png")
+    # put palette on the predicted mask (we use the same palette as Pascal VOC dataset)
+    palette = []
+    for j in range(256):
+        palette.extend((j, j, j))
+    palette[:3*21] = np.array([[0, 0, 0],
+        [128, 0, 0],
+        [0, 128, 0],
+        [128, 128, 0],
+        [0, 0, 128],
+        [128, 0, 128],
+        [0, 128, 128],
+        [128, 128, 128],
+        [64, 0, 0],
+        [192, 0, 0],
+        [64, 128, 0],
+        [192, 128, 0],
+        [64, 0, 128],
+        [192, 0, 128],
+        [64, 128, 128],
+        [192, 128, 128],
+        [0, 64, 0],
+        [128, 64, 0],
+        [0, 192, 0],
+        [128, 192, 0],
+        [0, 64, 128]
+        ], dtype='uint8').flatten()
+    out_png.putpalette(palette)
+    # out_border.putpalette(palette)
+
+    out_png.save(
+        "./polyp_results/" + name + ".png")
+    out_border.save(
+        "./polyp_results/border_" + name + ".png")
 
 # %%
